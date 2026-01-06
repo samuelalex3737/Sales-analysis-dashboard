@@ -1,3 +1,4 @@
+# app.py
 import io
 import numpy as np
 import pandas as pd
@@ -38,6 +39,62 @@ def comparable_previous_period(start: pd.Timestamp, end: pd.Timestamp):
     prev_end = start - pd.Timedelta(days=1)
     prev_start = prev_end - pd.Timedelta(days=days - 1)
     return prev_start, prev_end
+
+
+# ---------------- Filters helpers (GLOBAL + PER-GRAPH) ----------------
+def _apply_filters(
+    sales: pd.DataFrame,
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    region_sel: str = "All",
+    cat_sel: str = "All",
+    seg_sel: str = "All",
+    channel_sel: str = "All",
+    include_returns: bool = True,
+    show_only_returns: bool = False,
+    # per-graph (local) filters:
+    top_n_products: int | None = None,
+    min_orders_for_quadrant: int | None = None,
+    category_focus: str = "All",
+    discount_range: tuple[float, float] | None = None,  # pct in [0..1]
+):
+    """Apply global filters + optional local (graph) filters."""
+    df = sales[(sales["order_date"] >= start) & (sales["order_date"] <= end)].copy()
+
+    # Global filters
+    if region_sel != "All":
+        df = df[df["region"].eq(region_sel)]
+    if cat_sel != "All":
+        df = df[df["category"].eq(cat_sel)]
+    if seg_sel != "All":
+        df = df[df["segment"].eq(seg_sel)]
+    if channel_sel != "All":
+        df = df[df["channel"].eq(channel_sel)]
+
+    if show_only_returns:
+        df = df[df["is_return"].eq(1)]
+    elif not include_returns:
+        df = df[df["is_return"].eq(0)]
+
+    # Local filters
+    if category_focus != "All":
+        df = df[df["category"].eq(category_focus)]
+
+    if discount_range is not None:
+        lo, hi = discount_range
+        df = df[df["discount_pct"].between(lo, hi, inclusive="both")]
+
+    if min_orders_for_quadrant is not None:
+        # This is applied later at the aggregated level typically, but we keep it here for convenience
+        # (we'll re-apply after aggregation in the quadrant section).
+        pass
+
+    if top_n_products is not None:
+        # Not applied here; used in top-products aggregation step.
+        pass
+
+    return df
 
 
 @st.cache_data(show_spinner=False)
@@ -101,12 +158,20 @@ def data_quality_checks(orders, customers, products, sales):
 def compute_customer_first_purchase(sales: pd.DataFrame) -> pd.DataFrame:
     """Derive first purchase date from NON-return lines to avoid defining cohorts on returns."""
     base = sales[sales["is_return"].eq(0)].copy()
-    first = base.groupby("customer_id", as_index=False)["order_date"].min().rename(columns={"order_date": "first_purchase_date"})
+    first = (
+        base.groupby("customer_id", as_index=False)["order_date"]
+        .min()
+        .rename(columns={"order_date": "first_purchase_date"})
+    )
     return first
 
 
 def add_customer_spend_segment(df: pd.DataFrame) -> pd.DataFrame:
     """Segment customers by spend within the filtered dataset (dynamic)."""
+    if df.empty:
+        df["spend_segment"] = pd.Series(dtype="object")
+        return df
+
     cust_rev = df.groupby("customer_id", as_index=False)["line_revenue"].sum()
     cust_rev["pos_revenue"] = cust_rev["line_revenue"].clip(lower=0)
     q1, q2, q3 = cust_rev["pos_revenue"].quantile([0.25, 0.5, 0.75]).values
@@ -130,20 +195,41 @@ def kpi_block(current: dict, previous: dict):
             return None
         return cur - prev
 
-    cols[0].metric("Total Revenue", fmt_currency(current["revenue"]),
-                   None if previous["revenue"] == 0 else fmt_currency(delta(current["revenue"], previous["revenue"])))
-    cols[1].metric("Total Profit", fmt_currency(current["profit"]),
-                   None if previous["profit"] == 0 else fmt_currency(delta(current["profit"], previous["profit"])))
-    cols[2].metric("AOV", fmt_currency_2(current["aov"]),
-                   None if previous["aov"] == 0 else fmt_currency_2(delta(current["aov"], previous["aov"])))
-    cols[3].metric("Total Orders", f'{int(current["orders"]):,}',
-                   None if previous["orders"] == 0 else f'{int(delta(current["orders"], previous["orders"])):,}')
-    cols[4].metric("Profit Margin (%)", fmt_pct(current["margin"]),
-                   None if previous["margin"] == 0 else fmt_pct(delta(current["margin"], previous["margin"])))
-    cols[5].metric("Revenue Growth %", fmt_pct(current["rev_growth"]),
-                   None if previous["rev_growth"] == 0 else fmt_pct(delta(current["rev_growth"], previous["rev_growth"])))
-    cols[6].metric("Return Rate %", fmt_pct(current["return_rate"]),
-                   None if previous["return_rate"] == 0 else fmt_pct(delta(current["return_rate"], previous["return_rate"])))
+    cols[0].metric(
+        "Total Revenue",
+        fmt_currency(current["revenue"]),
+        None if previous["revenue"] == 0 else fmt_currency(delta(current["revenue"], previous["revenue"])),
+    )
+    cols[1].metric(
+        "Total Profit",
+        fmt_currency(current["profit"]),
+        None if previous["profit"] == 0 else fmt_currency(delta(current["profit"], previous["profit"])),
+    )
+    cols[2].metric(
+        "AOV",
+        fmt_currency_2(current["aov"]),
+        None if previous["aov"] == 0 else fmt_currency_2(delta(current["aov"], previous["aov"])),
+    )
+    cols[3].metric(
+        "Total Orders",
+        f'{int(current["orders"]):,}',
+        None if previous["orders"] == 0 else f'{int(delta(current["orders"], previous["orders"])):,}',
+    )
+    cols[4].metric(
+        "Profit Margin (%)",
+        fmt_pct(current["margin"]),
+        None if previous["margin"] == 0 else fmt_pct(delta(current["margin"], previous["margin"])),
+    )
+    cols[5].metric(
+        "Revenue Growth %",
+        fmt_pct(current["rev_growth"]),
+        None if previous["rev_growth"] == 0 else fmt_pct(delta(current["rev_growth"], previous["rev_growth"])),
+    )
+    cols[6].metric(
+        "Return Rate %",
+        fmt_pct(current["return_rate"]),
+        None if previous["return_rate"] == 0 else fmt_pct(delta(current["return_rate"], previous["return_rate"])),
+    )
 
 
 def compute_kpis(df: pd.DataFrame):
@@ -181,27 +267,37 @@ def insights_panel(df: pd.DataFrame):
     worst_margin = reg.sort_values("margin", ascending=True).head(1)
 
     if len(best_rev):
-        insights.append(f"Top region by revenue: **{best_rev.iloc[0]['region']}** ({fmt_currency(best_rev.iloc[0]['revenue'])}).")
+        insights.append(
+            f"Top region by revenue: **{best_rev.iloc[0]['region']}** ({fmt_currency(best_rev.iloc[0]['revenue'])})."
+        )
     if len(worst_margin):
-        insights.append(f"Lowest margin region: **{worst_margin.iloc[0]['region']}** ({fmt_pct(worst_margin.iloc[0]['margin'])}).")
+        insights.append(
+            f"Lowest margin region: **{worst_margin.iloc[0]['region']}** ({fmt_pct(worst_margin.iloc[0]['margin'])})."
+        )
 
     ret = df.groupby("category", as_index=False).agg(lines=("sales_line_id", "count"), returns=("is_return", "sum"))
     ret["return_rate"] = np.where(ret["lines"] > 0, ret["returns"] / ret["lines"], 0)
     top_ret_cat = ret.sort_values("return_rate", ascending=False).head(1)
     if len(top_ret_cat):
-        insights.append(f"Highest return-rate category: **{top_ret_cat.iloc[0]['category']}** ({fmt_pct(top_ret_cat.iloc[0]['return_rate'])}).")
+        insights.append(
+            f"Highest return-rate category: **{top_ret_cat.iloc[0]['category']}** ({fmt_pct(top_ret_cat.iloc[0]['return_rate'])})."
+        )
 
     prod_ret = df.groupby("product_id", as_index=False).agg(lines=("sales_line_id", "count"), returns=("is_return", "sum"))
     prod_ret["return_rate"] = np.where(prod_ret["lines"] > 0, prod_ret["returns"] / prod_ret["lines"], 0)
     top_ret_prod = prod_ret.sort_values("return_rate", ascending=False).head(1)
     if len(top_ret_prod):
-        insights.append(f"Highest return-rate product (by lines): **{top_ret_prod.iloc[0]['product_id']}** ({fmt_pct(top_ret_prod.iloc[0]['return_rate'])}).")
+        insights.append(
+            f"Highest return-rate product (by lines): **{top_ret_prod.iloc[0]['product_id']}** ({fmt_pct(top_ret_prod.iloc[0]['return_rate'])})."
+        )
 
     cust = df.groupby("customer_id", as_index=False)["line_revenue"].sum()
     cust["pos_revenue"] = cust["line_revenue"].clip(lower=0)
     if len(cust) >= 10:
         cutoff = max(1, int(np.ceil(0.10 * len(cust))))
-        share = cust.sort_values("pos_revenue", ascending=False).head(cutoff)["pos_revenue"].sum() / max(cust["pos_revenue"].sum(), 1e-9)
+        share = cust.sort_values("pos_revenue", ascending=False).head(cutoff)["pos_revenue"].sum() / max(
+            cust["pos_revenue"].sum(), 1e-9
+        )
         insights.append(f"Customer concentration: top 10% customers contribute **{fmt_pct(share)}** of positive revenue.")
 
     ddf = df[df["is_return"].eq(0)].copy()
@@ -211,13 +307,19 @@ def insights_panel(df: pd.DataFrame):
         direction = "negative" if corr < 0 else "positive"
         insights.append(f"Discount sensitivity: correlation(discount%, margin%) is **{corr:.2f}** ({direction}).")
 
-    prod = df.groupby(["product_id"], as_index=False).agg(revenue=("line_revenue", "sum"), profit=("line_profit", "sum"), orders=("order_id", "nunique"))
+    prod = df.groupby(["product_id"], as_index=False).agg(
+        revenue=("line_revenue", "sum"), profit=("line_profit", "sum"), orders=("order_id", "nunique")
+    )
     prod["margin"] = np.where(prod["revenue"] != 0, prod["profit"] / prod["revenue"], np.nan)
     rev_thresh = prod["revenue"].quantile(0.75)
     low_margin_thresh = prod["margin"].quantile(0.25)
-    attention = prod[(prod["revenue"] >= rev_thresh) & (prod["margin"] <= low_margin_thresh)].sort_values("revenue", ascending=False).head(3)
+    attention = prod[(prod["revenue"] >= rev_thresh) & (prod["margin"] <= low_margin_thresh)].sort_values(
+        "revenue", ascending=False
+    ).head(3)
     if len(attention) > 0:
-        items = ", ".join([f"{r.product_id} ({fmt_currency(r.revenue)}, {fmt_pct(r.margin)})" for r in attention.itertuples(index=False)])
+        items = ", ".join(
+            [f"{r.product_id} ({fmt_currency(r.revenue)}, {fmt_pct(r.margin)})" for r in attention.itertuples(index=False)]
+        )
         insights.append(f"High-revenue / low-margin products needing attention: {items}.")
 
     if len(insights) < 5:
@@ -228,7 +330,9 @@ def insights_panel(df: pd.DataFrame):
 
 # ---------------- UI ----------------
 st.title("Executive Sales Performance & Customer Insights Dashboard")
-st.caption("Decision-grade view of revenue, profit, margin, retention, discount discipline, returns risk, and portfolio mix.")
+st.caption(
+    "Decision-grade view of revenue, profit, margin, retention, discount discipline, returns risk, and portfolio mix."
+)
 
 orders, customers, products, sales = load_data()
 
@@ -245,10 +349,16 @@ sales = sales.merge(customers[["customer_id", "segment"]], on="customer_id", how
 sales = sales.merge(products[["product_id", "product_name", "sub_category"]], on="product_id", how="left")
 sales = sales.merge(cust_first, on="customer_id", how="left")
 
-st.sidebar.header("Filters")
+# ---------------- GLOBAL filters (sidebar) ----------------
+st.sidebar.header("Global Filters")
 min_date = sales["order_date"].min().date()
 max_date = sales["order_date"].max().date()
-date_range = st.sidebar.date_input("Date range", (min_date, max_date), min_value=min_date, max_value=max_date)
+date_range = st.sidebar.date_input(
+    "Date range",
+    (min_date, max_date),
+    min_value=min_date,
+    max_value=max_date,
+)
 
 regions = ["All"] + sorted(sales["region"].dropna().unique().tolist())
 categories = ["All"] + sorted(sales["category"].dropna().unique().tolist())
@@ -260,45 +370,82 @@ cat_sel = st.sidebar.selectbox("Product category", categories, index=0)
 seg_sel = st.sidebar.selectbox("Customer segment", segments, index=0)
 channel_sel = st.sidebar.selectbox("Channel", channels, index=0)
 
-include_returns = st.sidebar.toggle("Include returns (net view)", value=True, help="ON = include return lines (negative revenue/profit). OFF = sales only.")
+include_returns = st.sidebar.toggle(
+    "Include returns (net view)",
+    value=True,
+    help="ON = include return lines (negative revenue/profit). OFF = sales only.",
+)
 show_only_returns = st.sidebar.toggle("Show only returns", value=False)
 
 start = pd.to_datetime(date_range[0])
 end = pd.to_datetime(date_range[1])
 
-df = sales[(sales["order_date"] >= start) & (sales["order_date"] <= end)].copy()
-if region_sel != "All":
-    df = df[df["region"].eq(region_sel)]
-if cat_sel != "All":
-    df = df[df["category"].eq(cat_sel)]
-if seg_sel != "All":
-    df = df[df["segment"].eq(seg_sel)]
-if channel_sel != "All":
-    df = df[df["channel"].eq(channel_sel)]
+# ---------------- LOCAL (per-graph) filters (sidebar expander) ----------------
+# These do NOT affect every chart; only the chart(s) that use them.
+with st.sidebar.expander("Graph Filters (per-visual)", expanded=False):
+    st.caption("These filters apply only to specific visuals, not the whole dashboard.")
 
-if show_only_returns:
-    df = df[df["is_return"].eq(1)]
-elif not include_returns:
-    df = df[df["is_return"].eq(0)]
+    # For Top Products chart
+    top_n_products = st.slider("Top Products: Top N", min_value=5, max_value=30, value=10, step=1)
 
-df = add_customer_spend_segment(df)
+    # For Quadrant chart
+    min_orders_for_quadrant = st.slider(
+        "Quadrant: minimum orders per product",
+        min_value=1,
+        max_value=50,
+        value=3,
+        step=1,
+        help="Reduces noise by removing products with very few orders.",
+    )
 
+    # Optional category focus used by Discount vs Margin chart (local)
+    category_focus = st.selectbox(
+        "Discount vs Margin: category focus",
+        options=["All"] + sorted(sales["category"].dropna().unique().tolist()),
+        index=0,
+    )
+
+    # Discount range used by Discount vs Margin chart (local)
+    disc_lo, disc_hi = st.slider(
+        "Discount vs Margin: discount range",
+        min_value=0,
+        max_value=100,
+        value=(0, 60),
+        step=1,
+        help="Local filter in %; applies only to discount scatter.",
+    )
+    discount_range = (disc_lo / 100.0, disc_hi / 100.0)
+
+# ---------------- Build GLOBAL dataset once ----------------
+df_global = _apply_filters(
+    sales,
+    start=start,
+    end=end,
+    region_sel=region_sel,
+    cat_sel=cat_sel,
+    seg_sel=seg_sel,
+    channel_sel=channel_sel,
+    include_returns=include_returns,
+    show_only_returns=show_only_returns,
+)
+
+df_global = add_customer_spend_segment(df_global)
+
+# Previous period uses ONLY global filters (so KPI comparisons are consistent)
 prev_start, prev_end = comparable_previous_period(start, end)
-df_prev = sales[(sales["order_date"] >= prev_start) & (sales["order_date"] <= prev_end)].copy()
-if region_sel != "All":
-    df_prev = df_prev[df_prev["region"].eq(region_sel)]
-if cat_sel != "All":
-    df_prev = df_prev[df_prev["category"].eq(cat_sel)]
-if seg_sel != "All":
-    df_prev = df_prev[df_prev["segment"].eq(seg_sel)]
-if channel_sel != "All":
-    df_prev = df_prev[df_prev["channel"].eq(channel_sel)]
-if show_only_returns:
-    df_prev = df_prev[df_prev["is_return"].eq(1)]
-elif not include_returns:
-    df_prev = df_prev[df_prev["is_return"].eq(0)]
+df_prev = _apply_filters(
+    sales,
+    start=prev_start,
+    end=prev_end,
+    region_sel=region_sel,
+    cat_sel=cat_sel,
+    seg_sel=seg_sel,
+    channel_sel=channel_sel,
+    include_returns=include_returns,
+    show_only_returns=show_only_returns,
+)
 
-kpi_cur = compute_kpis(df)
+kpi_cur = compute_kpis(df_global)
 kpi_prev = compute_kpis(df_prev)
 kpi_cur["rev_growth"] = (kpi_cur["revenue"] / kpi_prev["revenue"] - 1) if kpi_prev["revenue"] != 0 else np.nan
 kpi_prev["rev_growth"] = np.nan
@@ -311,8 +458,8 @@ st.divider()
 # ---------------- Required visuals ----------------
 st.markdown("## Sales & Profitability Diagnostics")
 
-# 1) Monthly Sales Trend – Line chart
-m = df.copy()
+# 1) Monthly Sales Trend – Line chart (GLOBAL only)
+m = df_global.copy()
 m["month"] = m["order_date"].dt.to_period("M").dt.to_timestamp()
 m_month = m.groupby("month", as_index=False).agg(revenue=("line_revenue", "sum"), profit=("line_profit", "sum"))
 fig1 = px.line(
@@ -332,14 +479,19 @@ st.markdown(
     "- Compare with profit trend (below) to ensure growth is profitable, not discount-driven."
 )
 
-# 2) Top Products by Revenue – Bar chart
-top_prod = df.groupby(["product_id", "product_name"], as_index=False)["line_revenue"].sum().sort_values("line_revenue", ascending=False).head(10)
+# 2) Top Products by Revenue – Bar chart (GLOBAL + local Top N)
+top_prod = (
+    df_global.groupby(["product_id", "product_name"], as_index=False)["line_revenue"]
+    .sum()
+    .sort_values("line_revenue", ascending=False)
+    .head(top_n_products)
+)
 fig2 = px.bar(
     top_prod,
     x="line_revenue",
     y="product_name",
     orientation="h",
-    title="Top Products by Revenue (Top 10)",
+    title=f"Top Products by Revenue (Top {top_n_products})",
     labels={"line_revenue": "Revenue", "product_name": "Product"},
 )
 fig2.update_xaxes(tickprefix=CURRENCY, tickformat=",.0f")
@@ -351,8 +503,8 @@ st.markdown(
     "- Use for inventory and assortment prioritization."
 )
 
-# 3) Region-wise Sales Performance – Bar chart
-reg = df.groupby("region", as_index=False).agg(revenue=("line_revenue", "sum"), profit=("line_profit", "sum"))
+# 3) Region-wise Sales Performance – Bar chart (GLOBAL only)
+reg = df_global.groupby("region", as_index=False).agg(revenue=("line_revenue", "sum"), profit=("line_profit", "sum"))
 reg["margin"] = np.where(reg["revenue"] != 0, reg["profit"] / reg["revenue"], np.nan)
 fig3 = px.bar(
     reg.sort_values("revenue", ascending=False),
@@ -371,8 +523,8 @@ st.markdown(
     "- Supports resource allocation (sales capacity, marketing, fulfillment)."
 )
 
-# 4) Customer Segmentation by Spend – Histogram
-cust_spend = df.groupby("customer_id", as_index=False)["line_revenue"].sum()
+# 4) Customer Segmentation by Spend – Histogram (GLOBAL only)
+cust_spend = df_global.groupby("customer_id", as_index=False)["line_revenue"].sum()
 cust_spend["pos_revenue"] = cust_spend["line_revenue"].clip(lower=0)
 fig4 = px.histogram(
     cust_spend,
@@ -390,8 +542,8 @@ st.markdown(
     "- Use alongside the “top 10% share” insight to quantify concentration."
 )
 
-# 5) Profit Margin by Product Category – Bar chart
-cat = df.groupby("category", as_index=False).agg(revenue=("line_revenue", "sum"), profit=("line_profit", "sum"))
+# 5) Profit Margin by Product Category – Bar chart (GLOBAL only)
+cat = df_global.groupby("category", as_index=False).agg(revenue=("line_revenue", "sum"), profit=("line_profit", "sum"))
 cat["profit_margin"] = np.where(cat["revenue"] != 0, cat["profit"] / cat["revenue"], np.nan)
 fig5 = px.bar(
     cat.sort_values("profit_margin", ascending=False),
@@ -415,21 +567,23 @@ st.divider()
 # ---------------- Additional executive visuals ----------------
 st.markdown("## Executive Diagnostic Views")
 
-# A) Profit vs Revenue Quadrant (Scatter/Bubble) — REQUIRED
-quad = df.groupby(["product_id", "product_name", "category"], as_index=False).agg(
+# A) Profit vs Revenue Quadrant (Scatter/Bubble) — GLOBAL + local min_orders_for_quadrant
+quad = df_global.groupby(["product_id", "product_name", "category"], as_index=False).agg(
     revenue=("line_revenue", "sum"),
     profit=("line_profit", "sum"),
     orders=("order_id", "nunique"),
 )
 quad["margin"] = np.where(quad["revenue"] != 0, quad["profit"] / quad["revenue"], np.nan)
+quad_f = quad[quad["orders"] >= min_orders_for_quadrant].copy()
+
 figA = px.scatter(
-    quad,
+    quad_f,
     x="revenue",
     y="margin",
     size="orders",
     color="category",
     hover_name="product_name",
-    title="Profit vs Revenue Quadrant (Products) — Size = Orders, Color = Category",
+    title=f"Profit vs Revenue Quadrant (Products) — Min Orders = {min_orders_for_quadrant}",
     labels={"revenue": "Revenue", "margin": "Profit Margin"},
 )
 figA.update_xaxes(tickprefix=CURRENCY, tickformat=",.0f")
@@ -442,11 +596,15 @@ st.markdown(
     "- Compare categories to detect structural margin gaps."
 )
 
-# B) Repeat purchase rate trend — REQUIRED
-tmp = df[df["is_return"].eq(0)].copy()
+# B) Repeat purchase rate trend — GLOBAL only
+tmp = df_global[df_global["is_return"].eq(0)].copy()
 tmp["month"] = tmp["order_date"].dt.to_period("M").dt.to_timestamp()
 cust_month = tmp.groupby(["month", "customer_id"], as_index=False)["order_id"].nunique()
-month_total_customers = cust_month.groupby("month", as_index=False)["customer_id"].nunique().rename(columns={"customer_id": "customers"})
+month_total_customers = (
+    cust_month.groupby("month", as_index=False)["customer_id"]
+    .nunique()
+    .rename(columns={"customer_id": "customers"})
+)
 tmp_first = tmp.groupby("customer_id", as_index=False)["order_date"].min().rename(columns={"order_date": "first_purchase_date"})
 cust_month = cust_month.merge(tmp_first, on="customer_id", how="left")
 cust_month["is_repeat_in_month"] = cust_month["first_purchase_date"] < cust_month["month"]
@@ -471,8 +629,22 @@ st.markdown(
     "- Use to guide CRM, loyalty, and post-purchase initiatives."
 )
 
-# C) Discount vs Margin Relationship (Scatter + Smoothed Trend) — REQUIRED
-d = df[df["is_return"].eq(0)].copy()
+# C) Discount vs Margin Relationship (Scatter + Smoothed Trend) — GLOBAL + local category_focus + discount_range
+df_disc = _apply_filters(
+    sales,
+    start=start,
+    end=end,
+    region_sel=region_sel,
+    cat_sel=cat_sel,
+    seg_sel=seg_sel,
+    channel_sel=channel_sel,
+    include_returns=include_returns,
+    show_only_returns=show_only_returns,
+    category_focus=category_focus,
+    discount_range=discount_range,
+)
+
+d = df_disc[df_disc["is_return"].eq(0)].copy()
 d = d[d["line_revenue"] > 0].copy()
 d["line_margin"] = np.where(d["line_revenue"] != 0, d["line_profit"] / d["line_revenue"], np.nan)
 
@@ -510,6 +682,7 @@ figC.update_xaxes(tickformat=".0%")
 figC.update_yaxes(tickformat=".0%")
 figC.update_layout(height=430, margin=dict(l=10, r=10, t=55, b=10))
 st.plotly_chart(figC, use_container_width=True)
+
 st.markdown(
     "- Quantifies whether discounting is eroding profitability; the smoothed line shows typical margin by discount band.\n"
     "- If margin drops sharply beyond a threshold, set discount guardrails/approvals above that level.\n"
@@ -518,15 +691,29 @@ st.markdown(
 
 st.divider()
 
-# ---------------- Drill-down table + export ----------------
-st.markdown("## Drill-Down: Transactions (Filtered)")
+# ---------------- Drill-down table + export (GLOBAL dataset) ----------------
+st.markdown("## Drill-Down: Transactions (Filtered - Global Filters)")
 table_cols = [
-    "sales_line_id", "order_id", "order_date", "customer_id", "segment",
-    "region", "channel", "product_id", "product_name", "category",
-    "quantity", "unit_price", "unit_cost", "discount_pct", "shipping_cost_allocated",
-    "is_return", "line_revenue", "line_profit"
+    "sales_line_id",
+    "order_id",
+    "order_date",
+    "customer_id",
+    "segment",
+    "region",
+    "channel",
+    "product_id",
+    "product_name",
+    "category",
+    "quantity",
+    "unit_price",
+    "unit_cost",
+    "discount_pct",
+    "shipping_cost_allocated",
+    "is_return",
+    "line_revenue",
+    "line_profit",
 ]
-view = df[table_cols].sort_values("order_date", ascending=False)
+view = df_global[table_cols].sort_values("order_date", ascending=False)
 
 st.dataframe(
     view,
@@ -553,4 +740,6 @@ st.download_button(
 )
 
 st.divider()
-insights_panel(df)
+
+# Insights should be based on GLOBAL filters (otherwise it's confusing)
+insights_panel(df_global)
